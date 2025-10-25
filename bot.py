@@ -156,7 +156,7 @@ async def start(interaction: discord.Interaction, container: str):
 # --- AUTOCOMPLETE ---
 @restart.autocomplete("container")
 @stop.autocomplete("container")
-async def running_container_autocomplete(interaction: discord.Interaction, current: str):
+async def running_container_autocomplete(_: discord.Interaction, current: str):
     containers = get_containers(only_running=True)
     choices = []
     for name, status in containers:
@@ -165,7 +165,7 @@ async def running_container_autocomplete(interaction: discord.Interaction, curre
     return choices[:25]
 
 @start.autocomplete("container")
-async def stopped_container_autocomplete(interaction: discord.Interaction, current: str):
+async def stopped_container_autocomplete(_: discord.Interaction, current: str):
     containers = get_containers(only_stopped=True)
     choices = []
     for name, status in containers:
