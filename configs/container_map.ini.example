@@ -1,0 +1,5 @@
+[fs25-silage-old]
+game_name=fs25-silage-old
+nbsp_count=29
+suffix=Z
+xml_path=/opt/fs25/profile/silage-old/docs/dedicated_server/dedicatedServerConfig.xml
