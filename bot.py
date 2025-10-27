@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 TOKEN = os.getenv("DISCORD_TOKEN")
 ALLOWED_ROLE = int(os.getenv("ALLOWED_ROLE", "0"))
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-HOSTNAME = socket.gethostname()
+HOSTNAME = os.getenv("HOSTNAME", socket.gethostname())
+ENABLE_AAF = os.getenv("ENABLE_AAF_RENAME", "false").lower() == "true"
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
@@ -30,11 +31,15 @@ def run_docker_cmd(cmd):
         raise RuntimeError(result.stderr.strip())
     return result.stdout.strip()
 
+import fnmatch  # add this import near the top of bot.py
+
 def get_containers(only_running=False, only_stopped=False):
-    """Return a list of (name, status) tuples."""
+    """Return a list of (name, status) tuples, filtered by CONTAINER_FILTER (supports wildcards)."""
     cmd = ["ps", "-a", "--format", "{{.Names}}|{{.Status}}"]
     if only_running:
         cmd = ["ps", "--format", "{{.Names}}|{{.Status}}"]
+
+    container_filter = os.getenv("CONTAINER_FILTER", "").strip()
     try:
         output = run_docker_cmd(cmd)
         containers = []
@@ -44,35 +49,80 @@ def get_containers(only_running=False, only_stopped=False):
                 name, status = name.strip(), status.strip()
                 if only_stopped and status.lower().startswith("up"):
                     continue
+
+                # ✅ Apply filter with wildcard support (*fs25*, fs25*, *fs25)
+                if container_filter and container_filter != "*":
+                    if not fnmatch.fnmatch(name, container_filter):
+                        continue
+
                 containers.append((name, status))
-        logger.info(f"Found containers: {containers}")
         return containers
     except Exception as e:
         logger.error(f"Error fetching containers: {e}")
         return []
 
-def send_webhook(user, container_name, action):
+def call_external_script(container):
+    """Optionally run AAF rename script before restart and capture output."""
+    if os.getenv("ENABLE_AAF_RENAME", "false").lower() != "true":
+        logger.info("AAF rename disabled in .env")
+        return None, None
+
+    try:
+        result = subprocess.run(
+            ["/app/scripts/pre_restart.sh", container],
+            capture_output=True,   # 👈 REQUIRED to capture stdout
+            text=True              # 👈 converts bytes to string
+        )
+        logger.info(result.stdout)  # log everything from the script
+
+        nbspaces, gameline = None, None
+        for line in result.stdout.splitlines():
+            if line.startswith("WEBHOOK_NBSPS_WRITTEN:"):
+                nbspaces = line.split(":", 1)[1].strip()
+            if line.startswith("WEBHOOK_GAME_LINE:"):
+                gameline = line.split(":", 1)[1].strip()
+
+        return nbspaces, gameline
+    except Exception as e:
+        logger.warning(f"AAF rename script failed for {container}: {e}")
+        return None, None
+
+def send_webhook(user, container_name, action, nbspaces=None, gameline=None):
     """Send a Discord webhook notification for container actions."""
     if not WEBHOOK_URL:
         logger.warning("Webhook URL not set, skipping notification.")
         return
 
+    # Base colors
     colors = {
-        "start": 0x00FF00,   # 🟢 green
-        "restart": 0xFFFF00, # 🟡 yellow
-        "stop": 0xFF0000     # 🔴 red
+        "start": 0x00FF00,   # 🟢
+        "restart": 0xFFFF00, # 🟡
+        "stop": 0xFF0000     # 🔴
     }
-    color = colors.get(action, 0x808080)
+
+    # Turn green if AAF rename succeeded
+    if action == "restart" and nbspaces and ENABLE_AAF:
+        color = 0x00FF00
+    else:
+        color = colors.get(action, 0x808080)
+
+    # Embed fields
+    fields = [
+        {"name": "Container", "value": f"`{container_name}`", "inline": True},
+        {"name": "User", "value": f"{user.name} ({user.id})", "inline": True},
+        {"name": "Server Host", "value": f"`{HOSTNAME}`", "inline": False},
+    ]
+
+    # Only include AAF info if enabled and returned
+    if ENABLE_AAF and (nbspaces or gameline):
+        fields.append({"name": "Non-breaking Spaces Written", "value": str(nbspaces), "inline": True})
+        fields.append({"name": "Game Name Line", "value": gameline or "(not found)", "inline": False})
 
     embed = {
         "title": f"Container {action.capitalize()} Executed",
         "color": color,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "fields": [
-            {"name": "Container", "value": f"`{container_name}`", "inline": True},
-            {"name": "User", "value": f"{user.name} ({user.id})", "inline": True},
-            {"name": "Server Host", "value": f"`{HOSTNAME}`", "inline": False},
-        ],
+        "fields": fields,
         "footer": {"text": "Docker Discord Bot"},
     }
 
@@ -100,7 +150,6 @@ async def containers(interaction: discord.Interaction):
     if not is_authorized(interaction):
         await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
         return
-
     try:
         containers = get_containers()
         if not containers:
@@ -115,15 +164,29 @@ async def containers(interaction: discord.Interaction):
 @app_commands.describe(container="The name of the Docker container to restart")
 async def restart(interaction: discord.Interaction, container: str):
     if not is_authorized(interaction):
-        await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
+        await interaction.response.send_message(
+            "❌ You don't have permission to do that.", ephemeral=True
+        )
         return
 
+    # 👇 acknowledge right away (avoids 404 Unknown Interaction)
+    await interaction.response.defer(ephemeral=True)
+
     try:
-        run_docker_cmd(["restart", container])
-        send_webhook(interaction.user, container, "restart")
-        await interaction.response.send_message(f"🟡 Restarted `{container}` successfully.", ephemeral=True)
+        nbspaces, gameline = call_external_script(container)   # may take time
+        run_docker_cmd(["restart", container])                 # may take time
+        send_webhook(interaction.user, container, "restart", nbspaces, gameline)
+
+        # 👇 final follow-up message after long tasks finish
+        await interaction.followup.send(
+            f"🟡 Restarted `{container}` successfully.", ephemeral=True
+        )
+
     except Exception as e:
-        await interaction.response.send_message(f"⚠️ Error restarting `{container}`: {e}", ephemeral=True)
+        # use follow-up, not response, because we already deferred
+        await interaction.followup.send(
+            f"⚠️ Error restarting `{container}`: {e}", ephemeral=True
+        )
 
 @tree.command(name="stop", description="Stop a Docker container by name")
 @app_commands.describe(container="The name of the Docker container to stop")
@@ -131,13 +194,13 @@ async def stop(interaction: discord.Interaction, container: str):
     if not is_authorized(interaction):
         await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
         return
-
+    await interaction.response.defer(ephemeral=True)
     try:
         run_docker_cmd(["stop", container])
         send_webhook(interaction.user, container, "stop")
-        await interaction.response.send_message(f"🔴 Stopped `{container}` successfully.", ephemeral=True)
+        await interaction.followup.send(f"🔴 Stopped `{container}` successfully.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"⚠️ Error stopping `{container}`: {e}", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Error stopping `{container}`: {e}", ephemeral=True)
 
 @tree.command(name="start", description="Start a Docker container by name")
 @app_commands.describe(container="The name of the Docker container to start")
@@ -145,18 +208,20 @@ async def start(interaction: discord.Interaction, container: str):
     if not is_authorized(interaction):
         await interaction.response.send_message("❌ You don't have permission to do that.", ephemeral=True)
         return
-
+    await interaction.response.defer(ephemeral=True)
     try:
+        # ✅ Call the external rename script before starting
+        nbspaces, gameline = call_external_script(container)
         run_docker_cmd(["start", container])
-        send_webhook(interaction.user, container, "start")
-        await interaction.response.send_message(f"🟢 Started `{container}` successfully.", ephemeral=True)
+        send_webhook(interaction.user, container, "start", nbspaces, gameline)
+        await interaction.followup.send(f"🟢 Started `{container}` successfully.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"⚠️ Error starting `{container}`: {e}", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Error starting `{container}`: {e}", ephemeral=True)
 
 # --- AUTOCOMPLETE ---
 @restart.autocomplete("container")
 @stop.autocomplete("container")
-async def running_container_autocomplete(_: discord.Interaction, current: str):
+async def running_container_autocomplete(interaction: discord.Interaction, current: str):
     containers = get_containers(only_running=True)
     choices = []
     for name, status in containers:
@@ -165,7 +230,7 @@ async def running_container_autocomplete(_: discord.Interaction, current: str):
     return choices[:25]
 
 @start.autocomplete("container")
-async def stopped_container_autocomplete(_: discord.Interaction, current: str):
+async def stopped_container_autocomplete(interaction: discord.Interaction, current: str):
     containers = get_containers(only_stopped=True)
     choices = []
     for name, status in containers:
