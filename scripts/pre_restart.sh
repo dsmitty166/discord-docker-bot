@@ -53,7 +53,7 @@ fi
 
 UNICODE_PATTERN=""
 for ((i=1; i<=NBSP_COUNT; i++)); do
-  UNICODE_PATTERN+=$'\u00A0'   # Append non-breaking space (U+00A0)
+  UNICODE_PATTERN+=$'\u3164'   # Append non-breaking space (U+00A0)
 done
 UNICODE_PATTERN+="$SUFFIX"
 
